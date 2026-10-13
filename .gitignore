@@ -1,0 +1,18 @@
+# Python / Django
+__pycache__/
+*.py[cod]
+*.sqlite3
+*.log
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+backend/private_uploads/
+backend/staticfiles/
+
+# React / Vite
+node_modules/
+dist/
+coverage/
+.DS_Store
