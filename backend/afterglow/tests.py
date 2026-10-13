@@ -108,3 +108,66 @@ class AfterglowAPITests(APITestCase):
             "attachment": upload,
         }, format="multipart")
         self.assertEqual(response.status_code, 400)
+
+
+class SharingAndEditingTests(APITestCase):
+    def setUp(self):
+        self.owner_user = get_user_model().objects.create_user(
+            username="keeper@example.com", password="KeeperTest123!"
+        )
+        self.universe = Universe.objects.create(owner=self.owner_user, title="Eternal summer")
+        self.view_key = self.universe.issue_invite("view")
+        self.write_key = self.universe.issue_invite("contribute")
+        self.base = f"/api/universes/{self.universe.id}/"
+
+    def test_read_only_invite_cannot_post(self):
+        self.client.credentials(HTTP_X_UNIVERSE_INVITE=self.view_key)
+        self.assertEqual(self.client.get(self.base).status_code, 200)
+        response = self.client.post(self.base + "memories/", {
+            "kind": "note", "title": "Unauthorized", "story": "No."
+        }, format="json")
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(self.universe.memories.count(), 0)
+
+    def test_contribution_invite_requires_moderation(self):
+        self.client.credentials(HTTP_X_UNIVERSE_INVITE=self.write_key)
+        self.assertTrue(self.client.get(self.base).data["can_contribute"])
+        self.assertEqual(self.client.post(self.base + "memories/", {
+            "kind": "note", "title": "First dance", "story": "In the moonlight"
+        }, format="json").status_code, 201)
+        self.assertEqual(self.client.get(self.base + "memories/").data, [])
+
+    def test_sealed_memory_hidden_from_guests_not_owner(self):
+        item = Memory.objects.create(
+            universe=self.universe, title="A secret", story="For next year",
+            approved=True, unlock_at=timezone.now() + timedelta(days=365),
+        )
+        self.client.credentials(HTTP_X_UNIVERSE_INVITE=self.view_key)
+        r = self.client.get(self.base + "memories/")
+        self.assertEqual(r.data[0]["title"], "A sealed memory")
+        self.assertEqual(r.data[0]["story"], "")
+        self.client.credentials()
+        self.client.force_authenticate(user=self.owner_user)
+        r = self.client.get(self.base + "memories/")
+        self.assertEqual(r.data[0]["title"], "A secret")
+        self.assertEqual(r.data[0]["story"], "For next year")
+
+    def test_only_owner_can_change_and_export(self):
+        self.client.credentials(HTTP_X_UNIVERSE_INVITE=self.write_key)
+        self.assertEqual(self.client.patch(self.base, {"title": "Hacked"}, format="json").status_code, 403)
+        self.assertEqual(self.client.get(self.base + "export/").status_code, 401)
+        self.client.credentials()
+        self.client.force_authenticate(user=self.owner_user)
+        self.assertEqual(self.client.patch(self.base, {"title": "New title"}, format="json").status_code, 200)
+        self.assertEqual(self.client.get(self.base + "export/").status_code, 200)
+
+    def test_new_invitation_types_can_be_rotated_independently(self):
+        self.client.force_authenticate(user=self.owner_user)
+        rotated = self.client.post(self.base + "invite/", {"mode": "view"}, format="json")
+        self.assertEqual(rotated.status_code, 200)
+        self.assertNotEqual(rotated.data["invite_token"], self.view_key)
+        self.client.force_authenticate(user=None)
+        self.client.credentials(HTTP_X_UNIVERSE_INVITE=self.view_key)
+        self.assertEqual(self.client.get(self.base).status_code, 404)
+        self.client.credentials(HTTP_X_UNIVERSE_INVITE=self.write_key)
+        self.assertEqual(self.client.get(self.base).status_code, 200)

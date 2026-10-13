@@ -1,4 +1,9 @@
 import mimetypes
+import io
+import json
+import zipfile
+
+from django.http import HttpResponse
 
 from django.contrib.auth import authenticate, get_user_model
 from django.db import IntegrityError, transaction
@@ -13,7 +18,7 @@ from rest_framework.response import Response
 
 from .models import Memory, Universe
 from .serializers import (
-    MemoryCreateSerializer, MemorySerializer, RegisterSerializer, UniverseSerializer,
+    MemoryCreateSerializer, MemoryEditSerializer, MemorySerializer, RegisterSerializer, UniverseSerializer,
 )
 
 User = get_user_model()
@@ -25,7 +30,13 @@ def is_owner(request, universe):
 
 def can_access(request, universe):
     return is_owner(request, universe) or universe.accepts_invite(
-        request.headers.get("X-Universe-Invite", "")
+        request.headers.get("X-Universe-Invite", ""), mode="view"
+    )
+
+
+def can_contribute(request, universe):
+    return is_owner(request, universe) or universe.accepts_invite(
+        request.headers.get("X-Universe-Invite", ""), mode="contribute"
     )
 
 
@@ -99,28 +110,51 @@ def universes(request):
     serializer = UniverseSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
     universe = serializer.save(owner=request.user)
-    invite = universe.issue_invite()
+    view_token = universe.issue_invite("view")
+    contribution_token = universe.issue_invite("contribute")
     return Response({
         "universe": UniverseSerializer(universe).data,
-        "invite_token": invite,
+        "invite_token": view_token,
+        "view_invite_token": view_token,
+        "contribute_invite_token": contribution_token,
     }, status=status.HTTP_201_CREATED)
 
 
-@api_view(["GET"])
+@api_view(["GET", "PATCH", "DELETE"])
 def universe_detail(request, pk):
     universe = accessible_universe(request, pk)
-    return Response({
-        **UniverseSerializer(universe).data,
-        "is_owner": is_owner(request, universe),
-    })
+    owner = is_owner(request, universe)
+    if request.method == "GET":
+        return Response({
+            **UniverseSerializer(universe).data,
+            "is_owner": owner,
+            "can_contribute": can_contribute(request, universe)
+                and (owner or universe.allow_guest_posts),
+        })
+    if not owner:
+        raise PermissionDenied("Only the owner can change this universe.")
+    if request.method == "DELETE":
+        # Files are private and must be removed when a universe is deleted.
+        for item in universe.memories.all():
+            if item.attachment:
+                item.attachment.delete(save=False)
+        universe.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+    serializer = UniverseSerializer(universe, data=request.data, partial=True)
+    serializer.is_valid(raise_exception=True)
+    serializer.save()
+    return Response(serializer.data)
 
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def rotate_invite(request, pk):
     universe = get_object_or_404(Universe, pk=pk, owner=request.user)
-    token = universe.issue_invite()
-    return Response({"invite_token": token})
+    mode = request.data.get("mode", "view")
+    if mode not in ("view", "contribute"):
+        raise ValidationError({"mode": "Use view or contribute."})
+    token = universe.issue_invite(mode)
+    return Response({"invite_token": token, "mode": mode})
 
 
 @api_view(["GET", "POST"])
@@ -131,8 +165,10 @@ def memories(request, pk):
         items = universe.memories.all()
         if not owner:
             items = items.filter(approved=True)
-        return Response(MemorySerializer(items, many=True).data)
+        return Response(MemorySerializer(items, many=True, context={"is_owner": owner}).data)
 
+    if not owner and not can_contribute(request, universe):
+        raise PermissionDenied("You need a contribution invitation to add a memory.")
     if not owner and not universe.allow_guest_posts:
         raise PermissionDenied("Guest contributions are closed for this universe.")
     serializer = MemoryCreateSerializer(data=request.data)
@@ -142,7 +178,7 @@ def memories(request, pk):
         submitted_by=request.user if request.user.is_authenticated else None,
         approved=owner,
     )
-    return Response(MemorySerializer(item).data, status=status.HTTP_201_CREATED)
+    return Response(MemorySerializer(item, context={"is_owner": owner}).data, status=status.HTTP_201_CREATED)
 
 
 @api_view(["POST"])
@@ -173,7 +209,7 @@ def memory_media(request, pk):
     if not is_owner(request, item.universe) and not item.approved:
         raise NotFound("Attachment unavailable.")
     from django.utils import timezone
-    if item.unlock_at and item.unlock_at > timezone.now():
+    if not is_owner(request, item.universe) and item.unlock_at and item.unlock_at > timezone.now():
         raise NotFound("This memory is still sealed.")
     if not item.attachment:
         raise NotFound("This memory has no attachment.")
@@ -181,4 +217,63 @@ def memory_media(request, pk):
     response = FileResponse(item.attachment.open("rb"), content_type=content_type, as_attachment=False)
     response["Cache-Control"] = "private, no-store"
     response["X-Content-Type-Options"] = "nosniff"
+    return response
+
+
+@api_view(["PATCH", "DELETE"])
+@permission_classes([IsAuthenticated])
+def manage_memory(request, pk):
+    item = get_object_or_404(
+        Memory.objects.select_related("universe"), pk=pk, universe__owner=request.user
+    )
+    if request.method == "DELETE":
+        if item.attachment:
+            item.attachment.delete(save=False)
+        item.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+    serializer = MemoryEditSerializer(item, data=request.data, partial=True)
+    serializer.is_valid(raise_exception=True)
+    serializer.save()
+    return Response(MemorySerializer(item, context={"is_owner": True}).data)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def export_universe(request, pk):
+    universe = get_object_or_404(Universe, pk=pk, owner=request.user)
+    items = list(universe.memories.all())
+    max_bytes = 64 * 1024 * 1024
+    total_bytes = sum(item.attachment.size for item in items if item.attachment)
+    if total_bytes > max_bytes:
+        raise ValidationError("This export exceeds the 64 MB pilot limit.")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as archive:
+        meta = {
+            "title": universe.title,
+            "description": universe.description,
+            "occasion": universe.occasion,
+            "theme": universe.theme,
+            "event_date": universe.event_date.isoformat() if universe.event_date else None,
+            "memories": [
+                {
+                    "id": str(item.id), "title": item.title, "story": item.story,
+                    "kind": item.kind, "author": item.author_name,
+                    "approved": item.approved,
+                    "unlock_at": item.unlock_at.isoformat() if item.unlock_at else None,
+                    "created_at": item.created_at.isoformat(),
+                    "attachment": item.attachment.name.rsplit("/", 1)[-1] if item.attachment else None,
+                } for item in items
+            ],
+        }
+        archive.writestr("memories.json", json.dumps(meta, ensure_ascii=False, indent=2))
+        for item in items:
+            if item.attachment:
+                with item.attachment.open("rb") as source:
+                    archive.writestr(
+                        "attachments/" + item.attachment.name.rsplit("/", 1)[-1],
+                        source.read(),
+                    )
+    response = HttpResponse(buf.getvalue(), content_type="application/zip")
+    response["Content-Disposition"] = 'attachment; filename="afterglow-memories.zip"'
+    response["Cache-Control"] = "private, no-store"
     return response

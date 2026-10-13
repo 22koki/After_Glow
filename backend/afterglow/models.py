@@ -38,22 +38,29 @@ class Universe(models.Model):
     event_date = models.DateField(null=True, blank=True)
     allow_guest_posts = models.BooleanField(default=True)
     invite_token_hash = models.CharField(max_length=64, blank=True)
+    contribute_token_hash = models.CharField(max_length=64, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         ordering = ["-created_at"]
 
-    def issue_invite(self):
+    def issue_invite(self, mode="view"):
+        if mode not in ("view", "contribute"):
+            raise ValueError("Invalid invitation type.")
         token = secrets.token_urlsafe(32)
-        self.invite_token_hash = hashlib.sha256(token.encode()).hexdigest()
-        self.save(update_fields=["invite_token_hash"])
+        field = "invite_token_hash" if mode == "view" else "contribute_token_hash"
+        setattr(self, field, hashlib.sha256(token.encode()).hexdigest())
+        self.save(update_fields=[field])
         return token
 
-    def accepts_invite(self, token):
-        if not token or not self.invite_token_hash or len(token) > 256:
+    def accepts_invite(self, token, mode="view"):
+        if not token or len(token) > 256:
             return False
         digest = hashlib.sha256(token.encode()).hexdigest()
-        return hmac.compare_digest(digest, self.invite_token_hash)
+        hashes = [self.contribute_token_hash] if mode == "contribute" else [
+            self.invite_token_hash, self.contribute_token_hash
+        ]
+        return any(hmac.compare_digest(digest, key) for key in hashes if key)
 
     def __str__(self):
         return self.title

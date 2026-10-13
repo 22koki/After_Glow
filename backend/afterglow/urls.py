@@ -13,4 +13,6 @@ urlpatterns = [
     path("universes/<uuid:pk>/memories/", views.memories),
     path("memories/<uuid:pk>/moderate/", views.moderate_memory),
     path("memories/<uuid:pk>/media/", views.memory_media),
+    path("universes/<uuid:pk>/export/", views.export_universe),
+    path("memories/<uuid:pk>/", views.manage_memory),
 ]

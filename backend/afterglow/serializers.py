@@ -58,7 +58,7 @@ class MemoryCreateSerializer(serializers.ModelSerializer):
             if attachment.size > 8 * 1024 * 1024:
                 raise serializers.ValidationError({"attachment": "Maximum file size is 8 MB."})
             extension = Path(attachment.name).suffix.lower()
-            declared_type = getattr(attachment, "content_type", "")
+            declared_type = getattr(attachment, "content_type", "").split(";")[0].strip().lower()
             if kind == "photo":
                 allowed = {".jpg": "JPEG", ".jpeg": "JPEG", ".png": "PNG", ".webp": "WEBP"}
                 if extension not in allowed or declared_type not in {"image/jpeg", "image/png", "image/webp"}:
@@ -101,13 +101,28 @@ class MemorySerializer(serializers.ModelSerializer):
     def get_locked(self, obj):
         return bool(obj.unlock_at and obj.unlock_at > timezone.now())
 
+    def is_sealed_for_viewer(self, obj):
+        return self.get_locked(obj) and not self.context.get("is_owner", False)
+
     def get_title(self, obj):
-        return "A sealed memory" if self.get_locked(obj) else obj.title
+        return "A sealed memory" if self.is_sealed_for_viewer(obj) else obj.title
 
     def get_story(self, obj):
-        return "" if self.get_locked(obj) else obj.story
+        return "" if self.is_sealed_for_viewer(obj) else obj.story
 
     def get_media_url(self, obj):
-        if self.get_locked(obj) or not obj.attachment:
+        if self.is_sealed_for_viewer(obj) or not obj.attachment:
             return None
         return f"/api/memories/{obj.id}/media/"
+
+
+class MemoryEditSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Memory
+        fields = ["title", "story", "author_name", "unlock_at"]
+
+    def validate(self, attrs):
+        if "story" in attrs and self.instance and self.instance.kind == "note":
+            if not attrs["story"].strip():
+                raise serializers.ValidationError({"story": "A written memory needs a story."})
+        return attrs
