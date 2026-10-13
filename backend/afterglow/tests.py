@@ -17,7 +17,7 @@ class AfterglowAPITests(APITestCase):
             username="owner@example.com", password="TestPass123!", first_name="Alex"
         )
         self.universe = Universe.objects.create(owner=self.user, title="Our little cosmos")
-        self.invite = self.universe.issue_invite()
+        self.invite = self.universe.issue_invite("contribute")
         self.base = f"/api/universes/{self.universe.id}/"
 
     def owner(self):
@@ -71,7 +71,7 @@ class AfterglowAPITests(APITestCase):
     def test_rotate_invite_invalidates_previous_link(self):
         self.owner()
         self.client.credentials()
-        response = self.client.post(self.base + "invite/")
+        response = self.client.post(self.base + "invite/", {"mode": "contribute"}, format="json")
         self.assertEqual(response.status_code, 200)
         self.assertNotEqual(response.data["invite_token"], self.invite)
         self.guest()
